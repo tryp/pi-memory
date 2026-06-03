@@ -20,8 +20,9 @@
 import type { ExtensionAPI, AgentToolResult, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { join, resolve } from "node:path";
-import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { MemoryStore } from "./store.js";
 import { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
 import { embed } from "./embedder.js";
@@ -452,10 +453,54 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (!store) return;
 
+<<<<<<< HEAD
     try {
       // Immediate visual feedback — user sees this as soon as C-c C-c fires
       if (cachedCtx && pendingUserMessages.length >= 3) {
         cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
+=======
+    // Immediate visual feedback — user sees this as soon as C-c C-c fires
+    if (cachedCtx) {
+      cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
+    }
+
+    // Consolidate if we have enough conversation
+    if (pendingUserMessages.length >= 3) {
+      try {
+        // Write consolidation data to a temp file and spawn a detached worker
+        // so the user gets their prompt back immediately.
+        const data = {
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          sessionCwd,
+          sessionId,
+          dbPath: resolvedDbPath,
+          model: injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
+          facts: store.listSemantic(undefined, 200).map(f => ({ key: f.key, value: f.value })),
+          lessons: store.listLessons(undefined, 100).map(l => ({ rule: l.rule, category: l.category })),
+        };
+
+        const tmpDir = mkdtempSync(join(tmpdir(), "pi-mem-bg-"));
+        const dataFile = join(tmpDir, "consolidation.json");
+        writeFileSync(dataFile, JSON.stringify(data));
+
+        // Resolve worker path relative to this bundle
+        const workerUrl = new URL("./consolidation-worker.mjs", import.meta.url);
+        const workerPath = workerUrl.pathname;
+
+        const proc = spawn(process.execPath, [workerPath, dataFile], {
+          detached: true,
+          stdio: ["ignore", "ignore", "pipe"],
+          cwd: sessionCwd || process.cwd(),
+          env: { ...process.env },
+        });
+        proc.unref(); // Allow parent to exit without waiting for child
+        proc.stderr.on("data", (d) => {
+          console.error(`[pi-memory-worker] ${d.toString().trim()}`);
+        });
+      } catch {
+        // Best-effort — don't crash on shutdown
+>>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
       }
 
       // Consolidate if we have enough conversation

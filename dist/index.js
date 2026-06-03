@@ -1,8 +1,14 @@
 // src/index.ts
 import { Type } from "@sinclair/typebox";
 import { join, resolve } from "node:path";
+<<<<<<< HEAD
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+=======
+import { homedir, tmpdir } from "node:os";
+import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { spawn } from "node:child_process";
+>>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
 
 // src/store.ts
 import { createRequire } from "node:module";
@@ -63,10 +69,13 @@ var MemoryStore = class {
     } catch {
     }
     try {
+<<<<<<< HEAD
       this.db.exec(`ALTER TABLE semantic ADD COLUMN embedding BLOB`);
     } catch {
     }
     try {
+=======
+>>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS semantic_fts USING fts5(key, value, content='semantic', content_rowid='rowid');
 
@@ -442,6 +451,7 @@ async function buildSelectiveBlock(store, prompt, cwd, config) {
     const parts = r.key.split(".");
     return parts.length >= 2 && parts[1] === slug;
   }) : results;
+<<<<<<< HEAD
   const seen = new Set(filteredResults.map((r) => r.key));
   const SEMANTIC_THRESHOLD = 0.25;
   const SEMANTIC_LIMIT = 8;
@@ -504,6 +514,13 @@ async function buildSelectiveBlock(store, prompt, cwd, config) {
     semanticCount = filteredResults.length;
     store.touchAccessed(filteredResults.map((r) => r.key));
   }
+=======
+  if (filteredResults.length > 0) {
+    sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
+    semanticCount = filteredResults.length;
+    store.touchAccessed(filteredResults.map((r) => r.key));
+  }
+>>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
   const lessons = mode === "selective" ? getRelevantLessons(store, prompt, cwd) : store.listLessons(void 0, 50, slug || void 0);
   if (lessons.length > 0) {
     const corrections = lessons.filter((l) => l.negative);
@@ -1069,9 +1086,52 @@ ${text}` };
   });
   pi.on("session_shutdown", async () => {
     if (!store) return;
+<<<<<<< HEAD
     try {
       if (cachedCtx && pendingUserMessages.length >= 3) {
         cachedCtx.ui.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
+=======
+    if (cachedCtx) {
+      cachedCtx.ui.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
+    }
+    if (pendingUserMessages.length >= 3) {
+      try {
+        // Write consolidation data to a temp file and spawn a detached worker
+        // so the user gets their prompt back immediately.
+        const data = {
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          sessionCwd,
+          sessionId,
+          dbPath: resolvedDbPath,
+          model: injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
+          facts: store.listSemantic(void 0, 200).map((f) => ({ key: f.key, value: f.value })),
+          lessons: store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category })),
+        };
+        const tmpDir = mkdtempSync(join(tmpdir(), "pi-mem-bg-"));
+        const dataFile = join(tmpDir, "consolidation.json");
+        writeFileSync(dataFile, JSON.stringify(data));
+
+        // Resolve worker path relative to this bundle
+        const workerUrl = new URL("./consolidation-worker.mjs", import.meta.url);
+        const workerPath = workerUrl.pathname;
+        if (process.platform === "win32" && workerUrl.protocol === "file:") {
+          // Windows file:// path starts with / drive letter
+        }
+
+        const proc = spawn(process.execPath, [workerPath, dataFile], {
+          detached: true,
+          stdio: ["ignore", "ignore", "pipe"],
+          cwd: sessionCwd || process.cwd(),
+          env: { ...process.env },
+        });
+        proc.unref(); // Allow parent to exit without waiting for child
+        proc.stderr.on("data", (d) => {
+          console.error(`[pi-memory-worker] ${d.toString().trim()}`);
+        });
+      } catch {
+        // Best-effort — don't crash on shutdown
+>>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
       }
       if (pendingUserMessages.length >= 3) {
         try {
