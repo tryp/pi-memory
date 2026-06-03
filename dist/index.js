@@ -1,8 +1,9 @@
 // src/index.ts
 import { Type } from "@sinclair/typebox";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
+import { spawn } from "node:child_process";
 
 // src/store.ts
 import { DatabaseSync } from "node:sqlite";
@@ -53,6 +54,10 @@ var MemoryStore = class {
     `);
     try {
       this.db.exec(`ALTER TABLE semantic ADD COLUMN last_accessed TEXT`);
+    } catch {
+    }
+    try {
+      this.db.exec(`ALTER TABLE lessons ADD COLUMN project TEXT`);
     } catch {
     }
     try {
@@ -156,7 +161,8 @@ var MemoryStore = class {
         ORDER BY bm25(semantic_fts)
         LIMIT ?
       `).all(ftsQuery, limit);
-      return rows;
+      if (rows.length > 0) return rows;
+      return this._searchSemanticFallback(query, limit);
     } catch {
       return this._searchSemanticFallback(query, limit);
     }
@@ -179,7 +185,7 @@ var MemoryStore = class {
     }
   }
   // ─── Lessons ─────────────────────────────────────────────────────
-  addLesson(rule, category = "general", source = "consolidation", negative = false) {
+  addLesson(rule, category = "general", source = "consolidation", negative = false, project) {
     const trimmed = rule.trim();
     if (!trimmed) return { success: false, reason: "empty rule" };
     const normalizedCategory = category.trim().toLowerCase() || "general";
@@ -196,8 +202,8 @@ var MemoryStore = class {
       }
       const id = crypto.randomUUID();
       this.db.prepare(
-        "INSERT INTO lessons (id, rule, category, source, negative) VALUES (?, ?, ?, ?, ?)"
-      ).run(id, trimmed, normalizedCategory, source, negative ? 1 : 0);
+        "INSERT INTO lessons (id, rule, category, source, negative, project) VALUES (?, ?, ?, ?, ?, ?)"
+      ).run(id, trimmed, normalizedCategory, source, negative ? 1 : 0, project ?? null);
       this.logEvent("create", "lesson", id, trimmed.slice(0, 100));
       return { success: true, id };
     });
@@ -207,15 +213,32 @@ var MemoryStore = class {
     if (!row) return void 0;
     return { ...row, negative: !!row.negative };
   }
-  listLessons(category, limit = 50) {
+  /**
+   * List lessons, optionally filtered by category and/or project.
+   *
+   * Project filtering:
+   * - If `project` is provided, returns lessons where `project = slug` OR `project IS NULL`
+   *   (NULL = user-authored or pre-migration lessons, treated as global).
+   * - If `project` is not provided, returns all lessons (no project filter).
+   */
+  listLessons(category, limit = 50, project) {
     let rows;
-    if (category) {
+    if (category && project) {
+      const normalizedCategory = category.trim().toLowerCase();
+      rows = this.db.prepare(
+        "SELECT * FROM lessons WHERE category = ? AND (project = ? OR project IS NULL) AND is_deleted = 0 ORDER BY created_at DESC LIMIT ?"
+      ).all(normalizedCategory, project, limit);
+    } else if (category) {
       const normalizedCategory = category.trim().toLowerCase();
       rows = this.db.prepare("SELECT * FROM lessons WHERE category = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT ?").all(normalizedCategory, limit);
+    } else if (project) {
+      rows = this.db.prepare(
+        "SELECT * FROM lessons WHERE (project = ? OR project IS NULL) AND is_deleted = 0 ORDER BY created_at DESC LIMIT ?"
+      ).all(project, limit);
     } else {
       rows = this.db.prepare("SELECT * FROM lessons WHERE is_deleted = 0 ORDER BY created_at DESC LIMIT ?").all(limit);
     }
-    return rows.map((r) => ({ ...r, negative: !!r.negative }));
+    return rows.map((r) => ({ ...r, negative: !!r.negative, project: r.project ?? null }));
   }
   /**
    * Search lessons by relevance to a query. Uses FTS5 when available,
@@ -228,14 +251,16 @@ var MemoryStore = class {
     const ftsQuery = terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
     try {
       const rows = this.db.prepare(`
-        SELECT l.id, l.rule, l.category, l.source, l.negative, l.created_at
+        SELECT l.id, l.rule, l.category, l.source, l.negative, l.created_at, l.project
         FROM lessons l
         JOIN lessons_fts fts ON l.rowid = fts.rowid
         WHERE lessons_fts MATCH ? AND l.is_deleted = 0
         ORDER BY bm25(lessons_fts)
         LIMIT ?
       `).all(ftsQuery, limit);
-      return rows.map((r) => ({ ...r, negative: !!r.negative }));
+      const mapped = rows.map((r) => ({ ...r, negative: !!r.negative, project: r.project ?? null }));
+      if (mapped.length > 0) return mapped;
+      return this._searchLessonsFallback(query, limit);
     } catch {
       return this._searchLessonsFallback(query, limit);
     }
@@ -247,7 +272,7 @@ var MemoryStore = class {
     return all.map((entry) => {
       const text = `${entry.rule} ${entry.category}`.toLowerCase();
       const matches = terms.filter((t) => text.includes(t)).length;
-      return { entry: { ...entry, negative: !!entry.negative }, score: matches / terms.length };
+      return { entry: { ...entry, negative: !!entry.negative, project: entry.project ?? null }, score: matches / terms.length };
     }).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map(({ entry }) => entry);
   }
   deleteLesson(id) {
@@ -322,12 +347,17 @@ function buildSelectiveBlock(store, prompt, cwd, config) {
       }
     }
   }
-  if (results.length > 0) {
-    sections.push(formatSection("Relevant Memory", results.map(formatSemantic)));
-    semanticCount = results.length;
-    store.touchAccessed(results.map((r) => r.key));
+  const filteredResults = slug ? results.filter((r) => {
+    if (!r.key.startsWith("project.")) return true;
+    const parts = r.key.split(".");
+    return parts.length >= 2 && parts[1] === slug;
+  }) : results;
+  if (filteredResults.length > 0) {
+    sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
+    semanticCount = filteredResults.length;
+    store.touchAccessed(filteredResults.map((r) => r.key));
   }
-  const lessons = mode === "selective" ? getRelevantLessons(store, prompt, cwd) : store.listLessons(void 0, 50);
+  const lessons = mode === "selective" ? getRelevantLessons(store, prompt, cwd) : store.listLessons(void 0, 50, slug || void 0);
   if (lessons.length > 0) {
     const corrections = lessons.filter((l) => l.negative);
     const positives = lessons.filter((l) => !l.negative);
@@ -387,7 +417,11 @@ function buildFallbackBlock(store, cwd) {
     semanticCount += prefs.length;
   }
   const projects = store.listSemantic("project.", 50);
-  const relevant = cwd ? projects.filter((p) => p.key.includes(projectSlug(cwd)) || p.confidence >= 0.9) : projects;
+  const slug = cwd ? projectSlug(cwd) : "";
+  const relevant = slug ? projects.filter((p) => {
+    const parts = p.key.split(".");
+    return parts.length >= 2 && parts[1] === slug;
+  }) : projects;
   if (relevant.length > 0) {
     sections.push(formatSection("Project Context", relevant.map(formatSemantic)));
     semanticCount += relevant.length;
@@ -397,7 +431,7 @@ function buildFallbackBlock(store, cwd) {
     sections.push(formatSection("Tool Preferences", tools.map(formatSemantic)));
     semanticCount += tools.length;
   }
-  const lessons = store.listLessons(void 0, 50);
+  const lessons = store.listLessons(void 0, 50, slug || void 0);
   if (lessons.length > 0) {
     const corrections = lessons.filter((l) => l.negative);
     const positives = lessons.filter((l) => !l.negative);
@@ -594,7 +628,7 @@ function parseConsolidationResponse(text) {
     return { semantic: [], lessons: [] };
   }
 }
-function applyExtracted(store, extracted, source = "consolidation") {
+function applyExtracted(store, extracted, source = "consolidation", project) {
   let semanticCount = 0;
   let lessonCount = 0;
   for (const s of extracted.semantic) {
@@ -604,7 +638,8 @@ function applyExtracted(store, extracted, source = "consolidation") {
   }
   for (const l of extracted.lessons) {
     if (isDerivableLesson(l.rule)) continue;
-    const result = store.addLesson(l.rule, l.category, source, l.negative);
+    const lessonProject = source === "user" ? void 0 : project;
+    const result = store.addLesson(l.rule, l.category, source, l.negative, lessonProject);
     if (result.success) lessonCount++;
   }
   return { semantic: semanticCount, lessons: lessonCount };
@@ -680,12 +715,12 @@ function resolveDbPath(cwd) {
     const piMemory = settings?.["pi-memory"];
     warnUnknownKeys(piMemory, "pi-memory", PI_MEMORY_KNOWN_KEYS);
     if (piMemory && typeof piMemory === "object" && typeof piMemory.localPath === "string" && piMemory.localPath) {
-      return join(piMemory.localPath, "memory.db");
+      return resolve(cwd, piMemory.localPath, "memory.db");
     }
     const piTotalRecall = settings?.["pi-total-recall"];
     warnUnknownKeys(piTotalRecall, "pi-total-recall", PI_TOTAL_RECALL_KNOWN_KEYS);
     if (piTotalRecall && typeof piTotalRecall === "object" && typeof piTotalRecall.localPath === "string" && piTotalRecall.localPath) {
-      return join(piTotalRecall.localPath, "memory", "memory.db");
+      return resolve(cwd, piTotalRecall.localPath, "memory", "memory.db");
     }
   } catch {
   }
@@ -848,8 +883,41 @@ ${text}`
     }
     if (pendingUserMessages.length >= 3) {
       try {
-        await consolidateSession();
+        // Write consolidation data to a temp file and spawn a detached worker
+        // so the user gets their prompt back immediately.
+        const data = {
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          sessionCwd,
+          sessionId,
+          dbPath: resolvedDbPath,
+          model: injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
+          facts: store.listSemantic(void 0, 200).map((f) => ({ key: f.key, value: f.value })),
+          lessons: store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category })),
+        };
+        const tmpDir = mkdtempSync(join(tmpdir(), "pi-mem-bg-"));
+        const dataFile = join(tmpDir, "consolidation.json");
+        writeFileSync(dataFile, JSON.stringify(data));
+
+        // Resolve worker path relative to this bundle
+        const workerUrl = new URL("./consolidation-worker.mjs", import.meta.url);
+        const workerPath = workerUrl.pathname;
+        if (process.platform === "win32" && workerUrl.protocol === "file:") {
+          // Windows file:// path starts with / drive letter
+        }
+
+        const proc = spawn(process.execPath, [workerPath, dataFile], {
+          detached: true,
+          stdio: ["ignore", "ignore", "pipe"],
+          cwd: sessionCwd || process.cwd(),
+          env: { ...process.env },
+        });
+        proc.unref(); // Allow parent to exit without waiting for child
+        proc.stderr.on("data", (d) => {
+          console.error(`[pi-memory-worker] ${d.toString().trim()}`);
+        });
       } catch {
+        // Best-effort — don't crash on shutdown
       }
     }
     store.close();
@@ -875,6 +943,8 @@ ${text}`
         prompt,
         "--print",
         "--no-extensions",
+        "--no-tools",
+        "--no-session",
         "--model",
         injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL
       ], {
@@ -892,7 +962,8 @@ ${text}`
       ]);
       if (result.code === 0 && result.stdout) {
         const extracted = parseConsolidationResponse(result.stdout);
-        const applied = applyExtracted(store, extracted, `session:${sessionId ?? "unknown"}`);
+        const slug = sessionCwd ? projectSlug(sessionCwd) : void 0;
+        const applied = applyExtracted(store, extracted, `session:${sessionId ?? "unknown"}`, slug || void 0);
         if (applied.semantic + applied.lessons > 0) {
           console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
         }
