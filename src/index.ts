@@ -25,27 +25,8 @@ import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { MemoryStore } from "./store.js";
 import { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
-import { embed } from "./embedder.js";
-
-// Re-export internals so consumers (e.g. pi-dashboard's system-prompt route)
-// can build their own context blocks without reaching into ./dist/store.js.
-// The bundled `dist/index.js` inlines these, so prior `req('./dist/store.js')`
-// callers were always broken.
-export { MemoryStore } from "./store.js";
-export { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
 
 type ToolResult = AgentToolResult<unknown>;
-type MemorySearchParams = { query: string; limit?: number };
-type MemoryRememberParams = {
-  type: string;
-  key?: string;
-  value?: string;
-  rule?: string;
-  category?: string;
-  negative?: boolean;
-};
-type MemoryForgetParams = { type: string; key?: string; id?: string };
-type MemoryLessonsParams = { category?: string; limit?: number };
 function ok(text: string): ToolResult { return { content: [{ type: "text", text }], details: {} }; }
 
 /**
@@ -114,7 +95,7 @@ function warnUnknownKeys(block: unknown, blockName: string, knownKeys: readonly 
   );
 }
 
-const PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "perTurnInjection", "injectionMode"] as const;
+const PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "perTurnInjection"] as const;
 const PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"] as const;
 
 export function resolveDbPath(cwd: string): string {
@@ -161,9 +142,6 @@ function mergeMemorySettings(config: InjectorConfig, memorySettings: unknown): v
   }
   if (typeof m.perTurnInjection === "boolean") {
     config.perTurnInjection = m.perTurnInjection;
-  }
-  if (m.injectionMode === "system-prompt" || m.injectionMode === "context-hook") {
-    config.injectionMode = m.injectionMode;
   }
   if (typeof m.consolidationModel === "string" && m.consolidationModel.trim()) {
     config.consolidationModel = m.consolidationModel.trim();
@@ -223,11 +201,6 @@ export default function (pi: ExtensionAPI) {
   let resolvedDbPath: string = DEFAULT_DB_PATH;
   let injectorConfig: InjectorConfig = readSettingsConfig();
 
-  // Per-turn memory block computed by before_agent_start and spliced into the
-  // LLM request by the "context" hook (context-hook injection mode). Ephemeral:
-  // never persisted to session history or the consolidation queue.
-  let pendingContextBlock: string | null = null;
-
   // ─── Lifecycle ───────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
@@ -277,8 +250,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Inject stored memory as a one-shot custom message BEFORE any user
-      // message arrives. Only used when `perTurnInjection: false` is explicitly
-      // configured (session_start mode, opt-out from adaptive injection).
+      // message arrives. Matches pi-knowledge-search's pattern.
+      //
+      // Skipped when `perTurnInjection: true` — in that mode the
+      // before_agent_start handler below takes over with per-turn semantic
+      // matching via systemPrompt mutation.
       //
       // Historical note: v1.0.x mutated event.systemPrompt in before_agent_start.
       // That broke provider prefix caches on every turn boundary (any drift in
@@ -292,17 +268,9 @@ export default function (pi: ExtensionAPI) {
       // lessons, 8KB cap). Correct ordering, stable cache, simpler model.
       //
       // v1.3.x adds `perTurnInjection: true` as an opt-in to restore v1.0.x
-      // per-turn selective behavior.
-      //
-      // v1.4.0 flips the default: per-turn semantic injection via systemPrompt
-      // mutation in before_agent_start.
-      //
-      // v1.5.0 introduces injectionMode: "context-hook" as the new default.
-      // Memory is injected as an ephemeral message via the context hook instead
-      // of mutating systemPrompt. System prompt is now permanently stable,
-      // guaranteeing cache hits on the system prompt prefix regardless of topic.
-      // The session_start fallback dump is opt-in via `perTurnInjection: false`.
-      if (injectorConfig.perTurnInjection === false) {
+      // per-turn selective behavior (mutates systemPrompt, breaks cache on
+      // every turn boundary — users opt in knowing the tradeoff).
+      if (!injectorConfig.perTurnInjection) {
         try {
           const alreadyInjected = ctx.sessionManager
             .getEntries()
@@ -311,7 +279,7 @@ export default function (pi: ExtensionAPI) {
                 e.type === "custom_message" && e.customType === "pi-memory-context",
             );
           if (!alreadyInjected) {
-            const { text, stats: injStats } = await buildContextBlock(
+            const { text, stats: injStats } = buildContextBlock(
               store,
               sessionCwd,
               undefined, // no prompt → fallback: dump all relevant memory
@@ -336,75 +304,27 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ----------------------------------------------------------------
-  // Per-turn semantic injection (default). Runs on every user turn, searching
-  // memory relevant to the current prompt. Two injection strategies, selected
-  // by `injectionMode`:
+  // Opt-in per-turn selective injection (v1.3.0).
   //
-  //   "context-hook" (default) — stash the block here; the pi.on("context")
-  //     handler below splices it as an ephemeral message just before the
-  //     latest user message. The system prompt is NEVER modified, so its
-  //     prefix caches unconditionally; a memory change only misses the cache
-  //     from the injection point forward, not from the system-prompt root.
+  // When `perTurnInjection: true` is set, run a semantic search against the
+  // current user prompt and append matching memory to event.systemPrompt.
+  // MUST use systemPrompt (not { message }) — returning { message } puts the
+  // content AFTER the user message and causes the model to respond to the
+  // injected memory instead of the user. See v1.1.x postmortem.
   //
-  //   "system-prompt" (legacy v1.4.0) — append the block to event.systemPrompt.
-  //     Cache-stable only while the retrieved memory is unchanged; any change
-  //     (e.g. a topic shift retrieving different entries) invalidates the
-  //     prefix at the system-prompt root and rewrites the entire suffix at
-  //     cacheWrite rates.
-  //
-  // Correctness holds either way: systemPrompt is a separate field from the
-  // messages list, and the ephemeral recall message is inserted BEFORE the
-  // user's message, so the user's question remains the final user-role turn.
+  // This breaks provider prefix caches on every turn boundary — an accepted
+  // cost for users who want per-query relevance from large memory stores.
   // ----------------------------------------------------------------
   pi.on("before_agent_start", async (event, ctx) => {
     if (!store) return;
-    if (injectorConfig.perTurnInjection === false) return;
+    if (!injectorConfig.perTurnInjection) return;
 
-    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
-    const mode = injectorConfig.injectionMode ?? "context-hook";
+    const { text } = buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    if (!text) return;
 
-    if (mode === "system-prompt") {
-      pendingContextBlock = null;
-      if (!text) return;
-      return { systemPrompt: `${event.systemPrompt}\n\n${text}` };
-    }
-
-    // context-hook: never touch the system prompt; hand off to the context hook.
-    pendingContextBlock = text || null;
-    return;
-  });
-
-  // context-hook injection. Fires on every LLM call within a turn; splices the
-  // cached memory block as an ephemeral user message immediately BEFORE the
-  // latest user message — on every call, including tool-call continuations.
-  // Keeping the block at a stable position (just before the user turn) means
-  // the persisted history never contains it, so the prefix caches and each
-  // continuation grows append-only. The injected message is not written to
-  // agent.state.messages, session history, or the consolidation queue.
-  pi.on("context", async (event, _ctx) => {
-    if (!store) return;
-    if (injectorConfig.perTurnInjection === false) return;
-    if ((injectorConfig.injectionMode ?? "context-hook") !== "context-hook") return;
-    if (!pendingContextBlock) return;
-
-    const msgs = event.messages;
-    if (!msgs || msgs.length === 0) return;
-
-    // Insert before the latest user message (not merely the last message):
-    // on continuations the last message is a tool result, but the user turn
-    // is still where the memory belongs.
-    let idx = -1;
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if ((msgs[i] as any).role === "user") { idx = i; break; }
-    }
-    if (idx === -1) return;
-
-    const recallMessage = {
-      role: "user",
-      content: pendingContextBlock,
-      timestamp: Date.now(),
-    } as any;
-    return { messages: [...msgs.slice(0, idx), recallMessage, ...msgs.slice(idx)] };
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${text}`,
+    };
   });
 
 
@@ -453,12 +373,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (!store) return;
 
-<<<<<<< HEAD
-    try {
-      // Immediate visual feedback — user sees this as soon as C-c C-c fires
-      if (cachedCtx && pendingUserMessages.length >= 3) {
-        cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
-=======
     // Immediate visual feedback — user sees this as soon as C-c C-c fires
     if (cachedCtx) {
       cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
@@ -500,24 +414,11 @@ export default function (pi: ExtensionAPI) {
         });
       } catch {
         // Best-effort — don't crash on shutdown
->>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
       }
-
-      // Consolidate if we have enough conversation
-      if (pendingUserMessages.length >= 3) {
-        try {
-          await consolidateSession();
-        } catch {
-          // Best-effort — don't crash on shutdown
-        }
-      }
-    } finally {
-      if (cachedCtx) {
-        try { cachedCtx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
-      }
-      store.close();
-      store = null;
     }
+
+    store.close();
+    store = null;
   });
 
   // ─── Consolidation ──────────────────────────────────────────────
@@ -590,7 +491,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
-    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions.",
+    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions. Use before making assumptions about user preferences, tool choices, or project conventions. Include a limit parameter to cap results.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
@@ -598,8 +499,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
 
-      const searchParams = params as MemorySearchParams;
-      const results = store.searchSemantic(searchParams.query, searchParams.limit ?? 10);
+      const results = store.searchSemantic(params.query, params.limit ?? 10);
       if (results.length === 0) {
         return ok("No matching memories found.");
       }
@@ -615,7 +515,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_remember",
     label: "Memory Remember",
-    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys like pref.editor, project.rosie.lang, tool.sed.usage. For corrections, use type='lesson'.",
+    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys: pref.<area>.<topic>, project.<project-name>.<pattern>, tool.<name>.<usage>. For corrections, use type='lesson' with a broad category (e.g. 'testing', 'debugging', 'documentation', 'workflow'). Prefer reusing existing categories from memory_lessons over creating new ones.",
     parameters: Type.Object({
       type: Type.String({ description: "'fact' for key-value, 'lesson' for a correction" }),
       key: Type.Optional(Type.String({ description: "Dotted key for facts (e.g. pref.commit_style)" })),
@@ -627,45 +527,37 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
 
-      const input = params as MemoryRememberParams;
       // Defensively unwrap double-quoted string args from misbehaving model runners.
-      const rememberParams: MemoryRememberParams = {
-        ...input,
-        type: stripQuotes(input.type),
-        key: stripQuotes(input.key),
-        value: stripQuotes(input.value),
-        rule: stripQuotes(input.rule),
-        category: stripQuotes(input.category),
+      params = {
+        ...params,
+        type: stripQuotes(params.type),
+        key: stripQuotes(params.key),
+        value: stripQuotes(params.value),
+        rule: stripQuotes(params.rule),
+        category: stripQuotes(params.category),
       };
 
-      if (rememberParams.type !== "fact" && rememberParams.type !== "lesson") {
-        return ok(`Invalid type: ${rememberParams.type}. Must be 'fact' or 'lesson'.`);
+      if (params.type !== "fact" && params.type !== "lesson") {
+        return ok(`Invalid type: ${params.type}. Must be 'fact' or 'lesson'.`);
       }
 
-      if (rememberParams.type === "fact") {
-        if (!rememberParams.key || !rememberParams.value) {
+      if (params.type === "fact") {
+        if (!params.key || !params.value) {
           return ok("Both key and value required for facts");
         }
-        store.setSemantic(rememberParams.key, rememberParams.value, 0.95, "user");
-        // Fire-and-forget: compute and store embedding for the new/updated entry
-        // so it's available for semantic search in future sessions.
-        const _key = rememberParams.key;
-        const _val = rememberParams.value;
-        embed(`${_key.split(".").slice(1).join(" ")} ${_val}`)
-          .then(vec => { if (vec) store!.setEmbedding(_key, vec); })
-          .catch(() => {});
-        return ok(`Remembered: ${rememberParams.key} = ${rememberParams.value}`);
+        store.setSemantic(params.key, params.value, 0.95, "user");
+        return ok(`Remembered: ${params.key} = ${params.value}`);
       }
 
-      if (rememberParams.type === "lesson") {
-        if (!rememberParams.rule) {
+      if (params.type === "lesson") {
+        if (!params.rule) {
           return ok("Rule text required for lessons");
         }
-        const result = store.addLesson(rememberParams.rule, rememberParams.category ?? "general", "user", rememberParams.negative ?? false);
+        const result = store.addLesson(params.rule, params.category ?? "general", "user", params.negative ?? false);
         if (result.success) {
-          return ok(`Lesson learned: ${rememberParams.rule}`);
+          return ok(`Lesson learned: ${params.rule}`);
         }
-        return ok(`Already known (${result.reason}): ${rememberParams.rule}`);
+        return ok(`Already known (${result.reason}): ${params.rule}`);
       }
 
       return ok("Unknown type");
@@ -675,7 +567,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_forget",
     label: "Memory Forget",
-    description: "Remove a fact or lesson from persistent memory.",
+    description: "Remove a fact or lesson from persistent memory. Use after noticing a stale, incorrect, or retracted memory. Check memory_search or memory_lessons first to find the exact key or id.",
     parameters: Type.Object({
       type: Type.String(),
       key: Type.Optional(Type.String({ description: "Key for facts" })),
@@ -684,26 +576,25 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
 
-      const input = params as MemoryForgetParams;
-      const forgetParams: MemoryForgetParams = {
-        ...input,
-        type: stripQuotes(input.type),
-        key: stripQuotes(input.key),
-        id: stripQuotes(input.id),
+      params = {
+        ...params,
+        type: stripQuotes(params.type),
+        key: stripQuotes(params.key),
+        id: stripQuotes(params.id),
       };
 
-      if (forgetParams.type !== "fact" && forgetParams.type !== "lesson") {
-        return ok(`Invalid type: ${forgetParams.type}. Must be 'fact' or 'lesson'.`);
+      if (params.type !== "fact" && params.type !== "lesson") {
+        return ok(`Invalid type: ${params.type}. Must be 'fact' or 'lesson'.`);
       }
 
-      if (forgetParams.type === "fact" && forgetParams.key) {
-        const deleted = store.deleteSemantic(forgetParams.key);
-        return ok(deleted ? `Forgot: ${forgetParams.key}` : `Not found: ${forgetParams.key}`);
+      if (params.type === "fact" && params.key) {
+        const deleted = store.deleteSemantic(params.key);
+        return ok(deleted ? `Forgot: ${params.key}` : `Not found: ${params.key}`);
       }
 
-      if (forgetParams.type === "lesson" && forgetParams.id) {
-        const deleted = store.deleteLesson(forgetParams.id);
-        return ok(deleted ? `Forgot lesson ${forgetParams.id}` : `Not found: ${forgetParams.id}`);
+      if (params.type === "lesson" && params.id) {
+        const deleted = store.deleteLesson(params.id);
+        return ok(deleted ? `Forgot lesson ${params.id}` : `Not found: ${params.id}`);
       }
 
       return ok("Provide key (for facts) or id (for lessons)");
@@ -713,16 +604,15 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_lessons",
     label: "Memory Lessons",
-    description: "List learned corrections and lessons from past sessions.",
+    description: "List learned corrections and lessons from past sessions. Filter by a broad category (e.g. 'testing', 'debugging') to narrow results. Use before adding a new lesson to see existing categories.",
     parameters: Type.Object({
       category: Type.Optional(Type.String({ description: "Filter by category" })),
-      limit: Type.Optional(Type.Number({ description: "Max results (default 50)" })),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 20)" })),
     }) as any,
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
 
-      const lessonsParams = params as MemoryLessonsParams;
-      const lessons = store.listLessons(lessonsParams.category, lessonsParams.limit ?? 50);
+      const lessons = store.listLessons(params.category, params.limit ?? 20);
       if (lessons.length === 0) {
         return ok("No lessons learned yet.");
       }
@@ -738,7 +628,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_stats",
     label: "Memory Stats",
-    description: "Show memory statistics — how many facts, lessons, and events are stored.",
+    description: "Show memory statistics — how many facts, lessons, and events are stored. Use for a quick overview of store health and size.",
     parameters: Type.Object({}) as any,
     async execute(_id, _params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");

@@ -1,22 +1,14 @@
 // src/index.ts
 import { Type } from "@sinclair/typebox";
 import { join, resolve } from "node:path";
-<<<<<<< HEAD
-import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
-=======
 import { homedir, tmpdir } from "node:os";
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
->>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
 
 // src/store.ts
-import { createRequire } from "node:module";
+import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-var _require = createRequire(import.meta.url);
-var isBun = typeof globalThis.Bun !== "undefined";
-var DatabaseSync = isBun ? _require("bun:sqlite").Database : _require("node:sqlite").DatabaseSync;
 var MemoryStore = class {
   db;
   writeLock = Promise.resolve();
@@ -69,13 +61,6 @@ var MemoryStore = class {
     } catch {
     }
     try {
-<<<<<<< HEAD
-      this.db.exec(`ALTER TABLE semantic ADD COLUMN embedding BLOB`);
-    } catch {
-    }
-    try {
-=======
->>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
       this.db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS semantic_fts USING fts5(key, value, content='semantic', content_rowid='rowid');
 
@@ -155,23 +140,6 @@ var MemoryStore = class {
       if (result.changes > 0) this.logEvent("delete", "semantic", normalized);
       return result.changes > 0;
     });
-  }
-  /**
-   * Store a pre-computed embedding for a key.
-   * Converts Float32Array → Buffer for SQLite BLOB storage.
-   */
-  setEmbedding(key, embedding) {
-    const normalized = key.toLowerCase();
-    const blob = Buffer.from(new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength));
-    this.db.prepare("UPDATE semantic SET embedding = ? WHERE key = ?").run(blob, normalized);
-  }
-  /**
-   * Return all semantic keys with their raw embedding BLOBs.
-   * Used for in-memory cosine similarity at query time.
-   * Entries without an embedding have embedding = null.
-   */
-  getAllEmbeddings() {
-    return this.db.prepare("SELECT key, embedding FROM semantic ORDER BY updated_at DESC").all();
   }
   listSemantic(prefix, limit = 100) {
     if (prefix) {
@@ -351,85 +319,18 @@ function jaccard(a, b) {
   return intersection.size / union.size;
 }
 
-// src/embedder.ts
-var MODEL = "Xenova/all-MiniLM-L6-v2";
-var LOAD_TIMEOUT_MS = 3e4;
-var INFER_TIMEOUT_MS = 5e3;
-var TEXT_CHAR_LIMIT = 512;
-var _pipe = null;
-var _failed = false;
-async function getPipe() {
-  if (_failed) return null;
-  if (_pipe) return _pipe;
-  try {
-    const pkg = "@xenova/transformers";
-    const mod = await import(pkg).catch(() => null);
-    if (!mod) {
-      console.error("pi-memory: @xenova/transformers not installed, semantic search disabled");
-      _failed = true;
-      return null;
-    }
-    const { pipeline, env } = mod;
-    env.allowRemoteModels = true;
-    env.useBrowserCache = false;
-    _pipe = await withTimeout(
-      pipeline("feature-extraction", MODEL, { quantized: true }),
-      LOAD_TIMEOUT_MS,
-      "model load"
-    );
-    return _pipe;
-  } catch (err) {
-    console.error(`pi-memory: embedder unavailable (${err?.message ?? err}), using FTS-only`);
-    _failed = true;
-    return null;
-  }
-}
-async function embed(text) {
-  const pipe = await getPipe();
-  if (!pipe) return null;
-  try {
-    const out = await withTimeout(
-      pipe(text.slice(0, TEXT_CHAR_LIMIT), { pooling: "mean", normalize: true }),
-      INFER_TIMEOUT_MS,
-      "inference"
-    );
-    return new Float32Array(out.data);
-  } catch {
-    return null;
-  }
-}
-function similarity(a, b) {
-  let dot = 0;
-  const len = Math.min(a.length, b.length);
-  for (let i = 0; i < len; i++) dot += a[i] * b[i];
-  return dot;
-}
-function fromBlob(b) {
-  if (!b) return null;
-  const raw = Uint8Array.from(b);
-  return new Float32Array(raw.buffer);
-}
-function withTimeout(p, ms, label) {
-  return Promise.race([
-    p,
-    new Promise(
-      (_, reject) => setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms)
-    )
-  ]);
-}
-
 // src/injector.ts
 import os from "node:os";
 var MAX_CONTEXT_CHARS = 8e3;
 var SEARCH_LIMIT = 15;
 var LESSON_SEARCH_LIMIT = 15;
-async function buildContextBlock(store, cwd, prompt, config) {
+function buildContextBlock(store, cwd, prompt, config) {
   if (prompt?.trim()) {
     return buildSelectiveBlock(store, prompt, cwd, config);
   }
   return buildFallbackBlock(store, cwd);
 }
-async function buildSelectiveBlock(store, prompt, cwd, config) {
+function buildSelectiveBlock(store, prompt, cwd, config) {
   const sections = [];
   let semanticCount = 0;
   let lessonCount = 0;
@@ -438,11 +339,11 @@ async function buildSelectiveBlock(store, prompt, cwd, config) {
   const slug = cwd ? projectSlug(cwd) : "";
   if (slug) {
     const projectResults = store.searchSemantic(slug, 5);
-    const seen2 = new Set(results.map((r) => r.key));
+    const seen = new Set(results.map((r) => r.key));
     for (const r of projectResults) {
-      if (!seen2.has(r.key)) {
+      if (!seen.has(r.key)) {
         results.push(r);
-        seen2.add(r.key);
+        seen.add(r.key);
       }
     }
   }
@@ -451,76 +352,11 @@ async function buildSelectiveBlock(store, prompt, cwd, config) {
     const parts = r.key.split(".");
     return parts.length >= 2 && parts[1] === slug;
   }) : results;
-<<<<<<< HEAD
-  const seen = new Set(filteredResults.map((r) => r.key));
-  const SEMANTIC_THRESHOLD = 0.25;
-  const SEMANTIC_LIMIT = 8;
-  const allEmbs = store.getAllEmbeddings();
-  const promptVec = await embed(prompt);
-  const semanticKeys = /* @__PURE__ */ new Set();
-  if (promptVec) {
-    const semanticHits = allEmbs.flatMap(({ key, embedding }) => {
-      const vec = fromBlob(embedding);
-      if (!vec) return [];
-      const score = similarity(promptVec, vec);
-      return score >= SEMANTIC_THRESHOLD ? [{ key, score }] : [];
-    }).sort((a, b) => b.score - a.score).slice(0, SEMANTIC_LIMIT);
-    for (const { key } of semanticHits) {
-      semanticKeys.add(key);
-      if (!seen.has(key)) {
-        const entry = store.getSemantic(key);
-        if (entry) {
-          filteredResults.push(entry);
-          seen.add(key);
-        }
-      }
-    }
-    backfillEmbeddings(store, allEmbs.filter((r) => !r.embedding)).catch(() => {
-    });
-  }
-  const expandedPrefixes = /* @__PURE__ */ new Set();
-  for (const r of [...filteredResults]) {
-    const prefix = keyDomainPrefix(r.key);
-    if (!prefix || expandedPrefixes.has(prefix)) continue;
-    expandedPrefixes.add(prefix);
-    const limit = semanticKeys.has(r.key) ? 20 : 5;
-    for (const sibling of store.listSemantic(prefix, limit)) {
-      if (!seen.has(sibling.key)) {
-        filteredResults.push(sibling);
-        seen.add(sibling.key);
-      }
-    }
-  }
-  if (semanticKeys.size > 0) {
-    const semanticPrefixes = /* @__PURE__ */ new Set();
-    for (const k of semanticKeys) {
-      const p = keyDomainPrefix(k);
-      if (p) semanticPrefixes.add(p);
-    }
-    const isSemanticRelated = (key) => {
-      if (semanticKeys.has(key)) return true;
-      const p = keyDomainPrefix(key);
-      return p ? semanticPrefixes.has(p) : false;
-    };
-    const priority = filteredResults.filter((r) => isSemanticRelated(r.key));
-    const rest = filteredResults.filter((r) => !isSemanticRelated(r.key));
-    priority.sort((a, b) => a.key.localeCompare(b.key));
-    rest.sort((a, b) => a.key.localeCompare(b.key));
-    filteredResults.length = 0;
-    filteredResults.push(...priority, ...rest);
-  }
   if (filteredResults.length > 0) {
     sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
     semanticCount = filteredResults.length;
     store.touchAccessed(filteredResults.map((r) => r.key));
   }
-=======
-  if (filteredResults.length > 0) {
-    sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
-    semanticCount = filteredResults.length;
-    store.touchAccessed(filteredResults.map((r) => r.key));
-  }
->>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
   const lessons = mode === "selective" ? getRelevantLessons(store, prompt, cwd) : store.listLessons(void 0, 50, slug || void 0);
   if (lessons.length > 0) {
     const corrections = lessons.filter((l) => l.negative);
@@ -655,21 +491,12 @@ function daysSince(dateStr) {
 var MEMORY_DRIFT_CAVEAT = `## Before acting on memory
 - Memory records can become stale. If a memory names a file, function, or flag \u2014 verify it still exists before recommending it. "The memory says X exists" is not the same as "X exists now."
 - If a recalled memory conflicts with what you observe in the current code or project state, trust what you observe now.
-- Memories about project state (deadlines, decisions, architecture) decay fastest \u2014 check if still relevant.`;
-function keyDomainPrefix(key) {
-  const parts = key.split(".");
-  return parts.length >= 3 ? parts.slice(0, 2).join(".") : null;
-}
-async function backfillEmbeddings(store, missing) {
-  if (missing.length === 0) return;
-  for (const { key } of missing.slice(0, 10)) {
-    const entry = store.getSemantic(key);
-    if (!entry) continue;
-    const displayKey = key.split(".").slice(1).join(" ");
-    const vec = await embed(`${displayKey} ${entry.value}`);
-    if (vec) store.setEmbedding(key, vec);
-  }
-}
+- Memories about project state (deadlines, decisions, architecture) decay fastest \u2014 check if still relevant.
+
+## Searching memory proactively
+- Use \`memory_search\` to find specific facts relevant to your current task \u2014 the injected block above may be truncated or may not cover the angle you need.
+- Use \`memory_lessons\` with a category filter to review relevant learned corrections before acting.
+- Use \`memory_stats\` for a quick overview of store health.`;
 function projectSlug(cwd) {
   const parts = cwd.split("/").filter(Boolean);
   const skip = /* @__PURE__ */ new Set(["workplace", "local", "home", "src", "scratch", os.userInfo().username]);
@@ -697,7 +524,20 @@ Extract ONLY concrete, reusable facts \u2014 not summaries of what happened. Foc
    Example: { "rule": "Use sed to insert after ## Notes heading, not echo >> which appends after Tags", "category": "vault", "negative": true }
 
 5. **Validated approaches** \u2014 things the user explicitly confirmed worked well (positive signal)
-   Example: { "rule": "When deploying wiki changes, draft first and let user preview before publishing", "category": "wiki-edit", "negative": false }
+   Example: { "rule": "When deploying wiki changes, draft first and let user preview before publishing", "category": "documentation", "negative": false }
+
+## Category guidance for lessons
+
+Use broad, reusable categories \u2014 not per-file or per-session labels.
+
+**Good categories** (prefer these): testing, documentation, debugging, workflow,
+performance, security, deployment, project-structure, tooling, communication.
+
+**Avoid**: per-file slugs ("vault", "rosie-parser"), dates, session IDs,
+or topic fragments ("pentest", "blog") that won't generalize.
+
+If unsure, prefer one of the good categories above over inventing a new one.
+Merging narrow categories later is expensive; starting broad is cheap.
 
 ## What NOT to extract \u2014 these are derivable or ephemeral, and pollute memory:
 
@@ -883,7 +723,7 @@ function warnUnknownKeys(block, blockName, knownKeys) {
     `pi-memory: ignoring unknown key(s) in settings.json "${blockName}" block: ${unknown.join(", ")} (expected: ${knownKeys.join(", ")})`
   );
 }
-var PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "perTurnInjection", "injectionMode"];
+var PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "perTurnInjection"];
 var PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"];
 function resolveDbPath(cwd) {
   try {
@@ -912,9 +752,6 @@ function mergeMemorySettings(config, memorySettings) {
   }
   if (typeof m.perTurnInjection === "boolean") {
     config.perTurnInjection = m.perTurnInjection;
-  }
-  if (m.injectionMode === "system-prompt" || m.injectionMode === "context-hook") {
-    config.injectionMode = m.injectionMode;
   }
   if (typeof m.consolidationModel === "string" && m.consolidationModel.trim()) {
     config.consolidationModel = m.consolidationModel.trim();
@@ -947,7 +784,6 @@ function index_default(pi) {
   let cachedCtx = null;
   let resolvedDbPath = DEFAULT_DB_PATH;
   let injectorConfig = readSettingsConfig();
-  let pendingContextBlock = null;
   pi.on("session_start", async (_event, ctx) => {
     try {
       sessionCwd = ctx.cwd;
@@ -984,13 +820,13 @@ function index_default(pi) {
           }
         }, 5e3);
       }
-      if (injectorConfig.perTurnInjection === false) {
+      if (!injectorConfig.perTurnInjection) {
         try {
           const alreadyInjected = ctx.sessionManager.getEntries().some(
             (e) => e.type === "custom_message" && e.customType === "pi-memory-context"
           );
           if (!alreadyInjected) {
-            const { text, stats: injStats } = await buildContextBlock(
+            const { text, stats: injStats } = buildContextBlock(
               store,
               sessionCwd,
               void 0,
@@ -1015,40 +851,14 @@ function index_default(pi) {
   });
   pi.on("before_agent_start", async (event, ctx) => {
     if (!store) return;
-    if (injectorConfig.perTurnInjection === false) return;
-    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
-    const mode = injectorConfig.injectionMode ?? "context-hook";
-    if (mode === "system-prompt") {
-      pendingContextBlock = null;
-      if (!text) return;
-      return { systemPrompt: `${event.systemPrompt}
+    if (!injectorConfig.perTurnInjection) return;
+    const { text } = buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    if (!text) return;
+    return {
+      systemPrompt: `${event.systemPrompt}
 
-${text}` };
-    }
-    pendingContextBlock = text || null;
-    return;
-  });
-  pi.on("context", async (event, _ctx) => {
-    if (!store) return;
-    if (injectorConfig.perTurnInjection === false) return;
-    if ((injectorConfig.injectionMode ?? "context-hook") !== "context-hook") return;
-    if (!pendingContextBlock) return;
-    const msgs = event.messages;
-    if (!msgs || msgs.length === 0) return;
-    let idx = -1;
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === "user") {
-        idx = i;
-        break;
-      }
-    }
-    if (idx === -1) return;
-    const recallMessage = {
-      role: "user",
-      content: pendingContextBlock,
-      timestamp: Date.now()
+${text}`
     };
-    return { messages: [...msgs.slice(0, idx), recallMessage, ...msgs.slice(idx)] };
   });
   pi.on("agent_end", async (event, _ctx) => {
     for (const msg of event.messages) {
@@ -1086,18 +896,11 @@ ${text}` };
   });
   pi.on("session_shutdown", async () => {
     if (!store) return;
-<<<<<<< HEAD
-    try {
-      if (cachedCtx && pendingUserMessages.length >= 3) {
-        cachedCtx.ui.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
-=======
     if (cachedCtx) {
       cachedCtx.ui.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
     }
     if (pendingUserMessages.length >= 3) {
       try {
-        // Write consolidation data to a temp file and spawn a detached worker
-        // so the user gets their prompt back immediately.
         const data = {
           userMessages: pendingUserMessages,
           assistantMessages: pendingAssistantMessages,
@@ -1106,49 +909,28 @@ ${text}` };
           dbPath: resolvedDbPath,
           model: injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
           facts: store.listSemantic(void 0, 200).map((f) => ({ key: f.key, value: f.value })),
-          lessons: store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category })),
+          lessons: store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category }))
         };
         const tmpDir = mkdtempSync(join(tmpdir(), "pi-mem-bg-"));
         const dataFile = join(tmpDir, "consolidation.json");
         writeFileSync(dataFile, JSON.stringify(data));
-
-        // Resolve worker path relative to this bundle
         const workerUrl = new URL("./consolidation-worker.mjs", import.meta.url);
         const workerPath = workerUrl.pathname;
-        if (process.platform === "win32" && workerUrl.protocol === "file:") {
-          // Windows file:// path starts with / drive letter
-        }
-
         const proc = spawn(process.execPath, [workerPath, dataFile], {
           detached: true,
           stdio: ["ignore", "ignore", "pipe"],
           cwd: sessionCwd || process.cwd(),
-          env: { ...process.env },
+          env: { ...process.env }
         });
-        proc.unref(); // Allow parent to exit without waiting for child
+        proc.unref();
         proc.stderr.on("data", (d) => {
           console.error(`[pi-memory-worker] ${d.toString().trim()}`);
         });
       } catch {
-        // Best-effort — don't crash on shutdown
->>>>>>> 23bbd71 (feat: background consolidation worker for non-blocking shutdown)
       }
-      if (pendingUserMessages.length >= 3) {
-        try {
-          await consolidateSession();
-        } catch {
-        }
-      }
-    } finally {
-      if (cachedCtx) {
-        try {
-          cachedCtx.ui.setStatus("pi-memory", "");
-        } catch {
-        }
-      }
-      store.close();
-      store = null;
     }
+    store.close();
+    store = null;
   });
   async function consolidateSession() {
     if (!store) return;
@@ -1203,15 +985,14 @@ ${text}` };
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
-    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions.",
+    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions. Use before making assumptions about user preferences, tool choices, or project conventions. Include a limit parameter to cap results.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" }))
     }),
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
-      const searchParams = params;
-      const results = store.searchSemantic(searchParams.query, searchParams.limit ?? 10);
+      const results = store.searchSemantic(params.query, params.limit ?? 10);
       if (results.length === 0) {
         return ok("No matching memories found.");
       }
@@ -1224,7 +1005,7 @@ ${text}` };
   pi.registerTool({
     name: "memory_remember",
     label: "Memory Remember",
-    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys like pref.editor, project.rosie.lang, tool.sed.usage. For corrections, use type='lesson'.",
+    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys: pref.<area>.<topic>, project.<project-name>.<pattern>, tool.<name>.<usage>. For corrections, use type='lesson' with a broad category (e.g. 'testing', 'debugging', 'documentation', 'workflow'). Prefer reusing existing categories from memory_lessons over creating new ones.",
     parameters: Type.Object({
       type: Type.String({ description: "'fact' for key-value, 'lesson' for a correction" }),
       key: Type.Optional(Type.String({ description: "Dotted key for facts (e.g. pref.commit_style)" })),
@@ -1235,40 +1016,33 @@ ${text}` };
     }),
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
-      const input = params;
-      const rememberParams = {
-        ...input,
-        type: stripQuotes(input.type),
-        key: stripQuotes(input.key),
-        value: stripQuotes(input.value),
-        rule: stripQuotes(input.rule),
-        category: stripQuotes(input.category)
+      params = {
+        ...params,
+        type: stripQuotes(params.type),
+        key: stripQuotes(params.key),
+        value: stripQuotes(params.value),
+        rule: stripQuotes(params.rule),
+        category: stripQuotes(params.category)
       };
-      if (rememberParams.type !== "fact" && rememberParams.type !== "lesson") {
-        return ok(`Invalid type: ${rememberParams.type}. Must be 'fact' or 'lesson'.`);
+      if (params.type !== "fact" && params.type !== "lesson") {
+        return ok(`Invalid type: ${params.type}. Must be 'fact' or 'lesson'.`);
       }
-      if (rememberParams.type === "fact") {
-        if (!rememberParams.key || !rememberParams.value) {
+      if (params.type === "fact") {
+        if (!params.key || !params.value) {
           return ok("Both key and value required for facts");
         }
-        store.setSemantic(rememberParams.key, rememberParams.value, 0.95, "user");
-        const _key = rememberParams.key;
-        const _val = rememberParams.value;
-        embed(`${_key.split(".").slice(1).join(" ")} ${_val}`).then((vec) => {
-          if (vec) store.setEmbedding(_key, vec);
-        }).catch(() => {
-        });
-        return ok(`Remembered: ${rememberParams.key} = ${rememberParams.value}`);
+        store.setSemantic(params.key, params.value, 0.95, "user");
+        return ok(`Remembered: ${params.key} = ${params.value}`);
       }
-      if (rememberParams.type === "lesson") {
-        if (!rememberParams.rule) {
+      if (params.type === "lesson") {
+        if (!params.rule) {
           return ok("Rule text required for lessons");
         }
-        const result = store.addLesson(rememberParams.rule, rememberParams.category ?? "general", "user", rememberParams.negative ?? false);
+        const result = store.addLesson(params.rule, params.category ?? "general", "user", params.negative ?? false);
         if (result.success) {
-          return ok(`Lesson learned: ${rememberParams.rule}`);
+          return ok(`Lesson learned: ${params.rule}`);
         }
-        return ok(`Already known (${result.reason}): ${rememberParams.rule}`);
+        return ok(`Already known (${result.reason}): ${params.rule}`);
       }
       return ok("Unknown type");
     }
@@ -1276,7 +1050,7 @@ ${text}` };
   pi.registerTool({
     name: "memory_forget",
     label: "Memory Forget",
-    description: "Remove a fact or lesson from persistent memory.",
+    description: "Remove a fact or lesson from persistent memory. Use after noticing a stale, incorrect, or retracted memory. Check memory_search or memory_lessons first to find the exact key or id.",
     parameters: Type.Object({
       type: Type.String(),
       key: Type.Optional(Type.String({ description: "Key for facts" })),
@@ -1284,23 +1058,22 @@ ${text}` };
     }),
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
-      const input = params;
-      const forgetParams = {
-        ...input,
-        type: stripQuotes(input.type),
-        key: stripQuotes(input.key),
-        id: stripQuotes(input.id)
+      params = {
+        ...params,
+        type: stripQuotes(params.type),
+        key: stripQuotes(params.key),
+        id: stripQuotes(params.id)
       };
-      if (forgetParams.type !== "fact" && forgetParams.type !== "lesson") {
-        return ok(`Invalid type: ${forgetParams.type}. Must be 'fact' or 'lesson'.`);
+      if (params.type !== "fact" && params.type !== "lesson") {
+        return ok(`Invalid type: ${params.type}. Must be 'fact' or 'lesson'.`);
       }
-      if (forgetParams.type === "fact" && forgetParams.key) {
-        const deleted = store.deleteSemantic(forgetParams.key);
-        return ok(deleted ? `Forgot: ${forgetParams.key}` : `Not found: ${forgetParams.key}`);
+      if (params.type === "fact" && params.key) {
+        const deleted = store.deleteSemantic(params.key);
+        return ok(deleted ? `Forgot: ${params.key}` : `Not found: ${params.key}`);
       }
-      if (forgetParams.type === "lesson" && forgetParams.id) {
-        const deleted = store.deleteLesson(forgetParams.id);
-        return ok(deleted ? `Forgot lesson ${forgetParams.id}` : `Not found: ${forgetParams.id}`);
+      if (params.type === "lesson" && params.id) {
+        const deleted = store.deleteLesson(params.id);
+        return ok(deleted ? `Forgot lesson ${params.id}` : `Not found: ${params.id}`);
       }
       return ok("Provide key (for facts) or id (for lessons)");
     }
@@ -1308,15 +1081,14 @@ ${text}` };
   pi.registerTool({
     name: "memory_lessons",
     label: "Memory Lessons",
-    description: "List learned corrections and lessons from past sessions.",
+    description: "List learned corrections and lessons from past sessions. Filter by a broad category (e.g. 'testing', 'debugging') to narrow results. Use before adding a new lesson to see existing categories.",
     parameters: Type.Object({
       category: Type.Optional(Type.String({ description: "Filter by category" })),
-      limit: Type.Optional(Type.Number({ description: "Max results (default 50)" }))
+      limit: Type.Optional(Type.Number({ description: "Max results (default 20)" }))
     }),
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
-      const lessonsParams = params;
-      const lessons = store.listLessons(lessonsParams.category, lessonsParams.limit ?? 50);
+      const lessons = store.listLessons(params.category, params.limit ?? 20);
       if (lessons.length === 0) {
         return ok("No lessons learned yet.");
       }
@@ -1329,7 +1101,7 @@ ${text}` };
   pi.registerTool({
     name: "memory_stats",
     label: "Memory Stats",
-    description: "Show memory statistics \u2014 how many facts, lessons, and events are stored.",
+    description: "Show memory statistics \u2014 how many facts, lessons, and events are stored. Use for a quick overview of store health and size.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
@@ -1370,10 +1142,7 @@ function extractText(content) {
 }
 export {
   DEFAULT_CONSOLIDATION_MODEL,
-  MemoryStore,
-  buildContextBlock,
   index_default as default,
-  projectSlug,
   readSettingsConfig,
   resolveDbPath
 };

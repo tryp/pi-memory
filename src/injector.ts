@@ -415,7 +415,12 @@ function daysSince(dateStr: string): number {
 const MEMORY_DRIFT_CAVEAT = `## Before acting on memory
 - Memory records can become stale. If a memory names a file, function, or flag — verify it still exists before recommending it. "The memory says X exists" is not the same as "X exists now."
 - If a recalled memory conflicts with what you observe in the current code or project state, trust what you observe now.
-- Memories about project state (deadlines, decisions, architecture) decay fastest — check if still relevant.`;
+- Memories about project state (deadlines, decisions, architecture) decay fastest — check if still relevant.
+
+## Searching memory proactively
+- Use \`memory_search\` to find specific facts relevant to your current task — the injected block above may be truncated or may not cover the angle you need.
+- Use \`memory_lessons\` with a category filter to review relevant learned corrections before acting.
+- Use \`memory_stats\` for a quick overview of store health.`;
 
 /**
  * Extract domain prefix for sibling expansion.
