@@ -17,14 +17,14 @@
  * - memory_lessons: list learned corrections
  * - memory_stats: show memory statistics
  */
-import type { ExtensionAPI, AgentToolResult, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, AgentToolResult, SessionEntry, ToolExecutionEndEvent } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "@sinclair/typebox";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { MemoryStore } from "./store.js";
-import { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
+import { buildContextBlock, projectSlug, type InjectorConfig, type ToolTurnContext } from "./injector.js";
 
 type ToolResult = AgentToolResult<unknown>;
 function ok(text: string): ToolResult { return { content: [{ type: "text", text }], details: {} }; }
@@ -201,6 +201,56 @@ export default function (pi: ExtensionAPI) {
   let resolvedDbPath: string = DEFAULT_DB_PATH;
   let injectorConfig: InjectorConfig = readSettingsConfig();
 
+  // ─── Tool activity tracking for per-turn context enrichment ──────
+
+  interface ToolActivity {
+    toolName: string;
+    isError: boolean;
+    errorSnippet?: string;
+    args: Record<string, unknown>;
+    timestamp: number;
+  }
+
+  const MAX_TOOL_ACTIVITY = 10;
+  const recentToolActivity: ToolActivity[] = [];
+
+  function buildToolContext(): ToolTurnContext {
+    return {
+      toolNames: [...new Set(recentToolActivity.map(a => a.toolName))],
+      lastTool: recentToolActivity.length > 0
+        ? recentToolActivity[recentToolActivity.length - 1].toolName
+        : undefined,
+      hasErrors: recentToolActivity.some(a => a.isError),
+      errorTerms: recentToolActivity
+        .filter(a => a.isError && a.errorSnippet)
+        .map(a => a.errorSnippet!)
+        .slice(0, 3),
+      editActivity: recentToolActivity.some(a =>
+        a.toolName === "edit" || a.toolName === "write"
+      ),
+      testActivity: recentToolActivity.some(a =>
+        a.toolName === "bash" &&
+        typeof a.args?.command === "string" &&
+        (/\\b(test|spec|jest|mocha|pytest|vitest|check|lint)\\b/i.test(a.args.command))
+      ),
+    };
+  }
+
+  function extractErrorSnippet(result: any): string | undefined {
+    if (!result) return undefined;
+    if (typeof result === "string") {
+      const lines = result.split("\\n").filter((l: string) => /(error|fail|exit code|not found|enoent)/i.test(l));
+      return lines.slice(0, 2).join(" ").slice(0, 120) || undefined;
+    }
+    if (typeof result.content === "string") {
+      return extractErrorSnippet(result.content);
+    }
+    if (Array.isArray(result.content)) {
+      return extractErrorSnippet(result.content.map((c: any) => c.text || "").join("\\n"));
+    }
+    return undefined;
+  }
+
   // ─── Lifecycle ───────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
@@ -315,11 +365,36 @@ export default function (pi: ExtensionAPI) {
   // This breaks provider prefix caches on every turn boundary — an accepted
   // cost for users who want per-query relevance from large memory stores.
   // ----------------------------------------------------------------
+  // ----------------------------------------------------------------
+  // Tool execution tracking — records recent tool calls to enrich
+  // the per-turn memory search query with tool context.
+  // ----------------------------------------------------------------
+  pi.on("tool_execution_end", (event, _ctx) => {
+    if (!store) return;
+    if (!injectorConfig.perTurnInjection) return;
+
+    const activity: ToolActivity = {
+      toolName: event.toolName,
+      isError: event.isError,
+      errorSnippet: event.isError ? extractErrorSnippet(event.result) : undefined,
+      args: event.args as Record<string, unknown>,
+      timestamp: Date.now(),
+    };
+    recentToolActivity.push(activity);
+    if (recentToolActivity.length > MAX_TOOL_ACTIVITY) {
+      recentToolActivity.shift();
+    }
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     if (!store) return;
     if (!injectorConfig.perTurnInjection) return;
 
-    const { text } = buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    const toolCtx = recentToolActivity.length > 0 ? buildToolContext() : undefined;
+    // Clear tool activity after consuming it for this turn
+    recentToolActivity.length = 0;
+
+    const { text } = buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig, toolCtx);
     if (!text) return;
 
     return {

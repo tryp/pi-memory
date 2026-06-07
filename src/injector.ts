@@ -7,7 +7,6 @@
  * - Fallback (no prompt): dump top entries by prefix (old behavior).
  */
 import type { MemoryStore, SemanticEntry, LessonEntry } from "./store.js";
-import { embed, similarity, fromBlob } from "./embedder.js";
 import os from "node:os";
 
 const MAX_CONTEXT_CHARS = 8000;
@@ -17,6 +16,25 @@ const LESSON_SEARCH_LIMIT = 15;
 export interface ContextBlock {
   text: string;
   stats: { semantic: number; lessons: number };
+}
+
+/**
+ * Context about recent agent tool activity, collected between turns.
+ * Used to enrich memory search queries beyond the user's prompt alone.
+ */
+export interface ToolTurnContext {
+  /** Names of tools called since the last agent turn */
+  toolNames: string[];
+  /** The most recently called tool */
+  lastTool?: string;
+  /** Whether any tool call produced an error */
+  hasErrors: boolean;
+  /** Error-related terms extracted from failed tool calls */
+  errorTerms: string[];
+  /** Whether edit/write tools were called (triggers tool.* prefix search) */
+  editActivity: boolean;
+  /** Whether test-related commands were run (triggers debugging/testing lesson search) */
+  testActivity: boolean;
 }
 
 /**
@@ -35,32 +53,22 @@ export interface InjectorConfig {
    * session_start (correct message ordering, stable prefix cache).
    *
    * When true, the session_start dump is skipped and each turn runs a
-   * semantic search against the user's current prompt. The injection
-   * strategy is then controlled by `injectionMode`.
+   * semantic search against the user's current prompt; the result is
+   * appended to `event.systemPrompt` in `before_agent_start`.
+   *
+   * Tradeoffs:
+   * - Pro: per-query relevance — facts outside the 8KB fallback dump reach
+   *   the model when they match the current prompt.
+   * - Con: the system prompt mutates every turn, invalidating the provider's
+   *   prefix cache after the system block (Bedrock / Anthropic cache_control).
+   *   Conversation suffix gets re-written at cacheWrite rates on every user
+   *   turn boundary (~12.5x cacheRead on Claude).
    *
    * Correctness is preserved either way: systemPrompt is a separate field
    * from the messages list, so the user's question remains the last
    * user-role message and the model responds to it.
    */
   perTurnInjection?: boolean;
-  /**
-   * Controls how per-turn memory is spliced into the LLM context.
-   * Only relevant when perTurnInjection is not false.
-   *
-   * "context-hook" (default): memory is injected as an ephemeral custom
-   *   message immediately before the latest user message, via the
-   *   pi.on("context") hook. The system prompt is never modified — it
-   *   caches unconditionally. A memory content change only causes a cache
-   *   miss at the injection point and forward (not from the system prompt
-   *   root). Injected messages are NOT persisted to session history or
-   *   fed back into consolidation.
-   *
-   * "system-prompt" (legacy v1.4.0 behavior): memory is appended to
-   *   event.systemPrompt in before_agent_start. Cache-stable when memory
-   *   content is unchanged, but a topic shift causes a cache miss that
-   *   cascades from the system prompt root through all downstream messages.
-   */
-  injectionMode?: "system-prompt" | "context-hook";
   /**
    * Model string passed to `pi --model` for session-end consolidation.
    * When omitted, the built-in default is used.  Useful for users on
@@ -78,23 +86,31 @@ export interface InjectorConfig {
  * Build context block. When `prompt` is provided, uses selective injection
  * (search-based). Otherwise falls back to prefix-based dump.
  */
-export async function buildContextBlock(store: MemoryStore, cwd?: string, prompt?: string, config?: InjectorConfig): Promise<ContextBlock> {
+export function buildContextBlock(store: MemoryStore, cwd?: string, prompt?: string, config?: InjectorConfig, toolContext?: ToolTurnContext): ContextBlock {
   if (prompt?.trim()) {
-    return buildSelectiveBlock(store, prompt, cwd, config);
+    return buildSelectiveBlock(store, prompt, cwd, config, toolContext);
   }
   return buildFallbackBlock(store, cwd);
 }
 
 // ─── Selective injection ─────────────────────────────────────────────
 
-async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, config?: InjectorConfig): Promise<ContextBlock> {
+function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, config?: InjectorConfig, toolContext?: ToolTurnContext): ContextBlock {
   const sections: string[] = [];
   let semanticCount = 0;
   let lessonCount = 0;
   const mode = config?.lessonInjection ?? "all";
 
-  // Search semantic memory using the user's prompt
-  const results = store.searchSemantic(prompt, SEARCH_LIMIT);
+  // Enrich search query with recent tool activity context
+  const queryParts = [prompt];
+  if (toolContext) {
+    if (toolContext.toolNames.length > 0) queryParts.push(...toolContext.toolNames);
+    if (toolContext.errorTerms.length > 0) queryParts.push(...toolContext.errorTerms);
+    if (toolContext.lastTool) queryParts.push(toolContext.lastTool);
+  }
+  const enrichedQuery = queryParts.join(" ");
+
+  const results = store.searchSemantic(enrichedQuery, SEARCH_LIMIT);
 
   // Also search with project slug if we have a cwd, to pull in project context
   const slug = cwd ? projectSlug(cwd) : "";
@@ -124,92 +140,6 @@ async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: str
       })
     : results;
 
-  // Shared dedup set — used by both semantic search and prefix expansion below.
-  const seen = new Set(filteredResults.map(r => r.key));
-
-  // ── Semantic similarity ──────────────────────────────────────────────────
-  // Embed the prompt and compare against stored embeddings to surface entries
-  // that are conceptually related but share no keywords with the query.
-  // Example: "I'm hungry" → finds user.health.diet via vector proximity.
-  //
-  // Gracefully degrades: if @xenova/transformers is unavailable or the model
-  // hasn't been downloaded yet, embed() returns null and we skip this step.
-  const SEMANTIC_THRESHOLD = 0.25;
-  const SEMANTIC_LIMIT = 8;
-  const allEmbs = store.getAllEmbeddings();
-  const promptVec = await embed(prompt);
-  const semanticKeys = new Set<string>(); // track entries surfaced by embedding search
-
-  if (promptVec) {
-    const semanticHits = allEmbs
-      .flatMap(({ key, embedding }) => {
-        const vec = fromBlob(embedding);
-        if (!vec) return [];
-        const score = similarity(promptVec, vec);
-        return score >= SEMANTIC_THRESHOLD ? [{ key, score }] : [];
-      })
-      .sort((a, b) => b.score - a.score)
-      .slice(0, SEMANTIC_LIMIT);
-
-    for (const { key } of semanticHits) {
-      // Always mark as a semantic hit for priority sorting, even if FTS already
-      // added this key — that way the reorder step promotes it to the front.
-      semanticKeys.add(key);
-      if (!seen.has(key)) {
-        const entry = store.getSemantic(key);
-        if (entry) {
-          filteredResults.push(entry);
-          seen.add(key);
-        }
-      }
-    }
-
-    // Background: compute and store embeddings for entries that lack them.
-    // Fire-and-forget — does not block injection.
-    backfillEmbeddings(store, allEmbs.filter(r => !r.embedding)).catch(() => {});
-  }
-
-  // ── Prefix co-expansion ──────────────────────────────────────────────────
-  // When any key in a sibling group appears in results (FTS or semantic),
-  // pull siblings under the same prefix. Semantic hits get full expansion (20);
-  // FTS hits are capped at 5 to prevent noisy matches from flooding context.
-  const expandedPrefixes = new Set<string>();
-  for (const r of [...filteredResults]) {  // snapshot — we push into filteredResults below
-    const prefix = keyDomainPrefix(r.key);
-    if (!prefix || expandedPrefixes.has(prefix)) continue;
-    expandedPrefixes.add(prefix);
-    const limit = semanticKeys.has(r.key) ? 20 : 5;
-    for (const sibling of store.listSemantic(prefix, limit)) {
-      if (!seen.has(sibling.key)) {
-        filteredResults.push(sibling);
-        seen.add(sibling.key);
-      }
-    }
-  }
-
-  // Reorder: semantic-related entries float to the front so they survive
-  // MAX_CONTEXT_CHARS truncation even when FTS-matched noise fills the list.
-  if (semanticKeys.size > 0) {
-    const semanticPrefixes = new Set<string>();
-    for (const k of semanticKeys) {
-      const p = keyDomainPrefix(k);
-      if (p) semanticPrefixes.add(p);
-    }
-    const isSemanticRelated = (key: string): boolean => {
-      if (semanticKeys.has(key)) return true;
-      const p = keyDomainPrefix(key);
-      return p ? semanticPrefixes.has(p) : false;
-    };
-    const priority = filteredResults.filter(r => isSemanticRelated(r.key));
-    const rest = filteredResults.filter(r => !isSemanticRelated(r.key));
-    // Deterministic key order within each group: same entries → same text →
-    // provider prefix cache hits when the topic doesn't change between turns.
-    priority.sort((a, b) => a.key.localeCompare(b.key));
-    rest.sort((a, b) => a.key.localeCompare(b.key));
-    filteredResults.length = 0;
-    filteredResults.push(...priority, ...rest);
-  }
-
   if (filteredResults.length > 0) {
     sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
     semanticCount = filteredResults.length;
@@ -218,14 +148,50 @@ async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: str
     store.touchAccessed(filteredResults.map(r => r.key));
   }
 
-  // Inject lessons — either all or filtered by relevance + project scope
+  // ── Activity-triggered bonus searches ──
+  // If the agent was editing files, pull in tool.* preferences
+  if (toolContext?.editActivity) {
+    const toolPrefs = store.listSemantic("tool.", 5);
+    for (const tp of toolPrefs) {
+      if (!results.some(r => r.key === tp.key)) {
+        results.push(tp);
+      }
+    }
+  }
+
+  // If tools errored or tests ran, pull in debugging/testing lessons
+  let bonusLessons: LessonEntry[] = [];
+  if (toolContext?.hasErrors || toolContext?.testActivity) {
+    const searchTerms: string[] = [];
+    if (toolContext.hasErrors) {
+      searchTerms.push("error", "fail", "debug");
+      if (toolContext.lastTool) searchTerms.push(toolContext.lastTool);
+      if (toolContext.errorTerms.length > 0) searchTerms.push(...toolContext.errorTerms);
+    }
+    if (toolContext.testActivity) {
+      searchTerms.push("test", "testing");
+    }
+    if (searchTerms.length > 0) {
+      bonusLessons = store.searchLessons(searchTerms.join(" "), 5);
+    }
+  }
+
+  // ── Lesson injection ──
   const lessons = mode === "selective"
     ? getRelevantLessons(store, prompt, cwd)
     : store.listLessons(undefined, 50, slug || undefined);
 
-  if (lessons.length > 0) {
-    const corrections = lessons.filter(l => l.negative);
-    const positives = lessons.filter(l => !l.negative);
+  // Merge bonus lessons into the main lesson set (dedup by id)
+  const allLessons = [...lessons];
+  for (const bl of bonusLessons) {
+    if (!allLessons.some(l => l.id === bl.id)) {
+      allLessons.push(bl);
+    }
+  }
+
+  if (allLessons.length > 0) {
+    const corrections = allLessons.filter(l => l.negative);
+    const positives = allLessons.filter(l => !l.negative);
 
     if (corrections.length > 0) {
       const formatted = corrections.map(l =>
@@ -239,7 +205,7 @@ async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: str
       );
       sections.push(formatSection("Validated Approaches", formatted));
     }
-    lessonCount = lessons.length;
+    lessonCount = allLessons.length;
   }
 
   if (sections.length === 0) {
@@ -421,36 +387,6 @@ const MEMORY_DRIFT_CAVEAT = `## Before acting on memory
 - Use \`memory_search\` to find specific facts relevant to your current task — the injected block above may be truncated or may not cover the angle you need.
 - Use \`memory_lessons\` with a category filter to review relevant learned corrections before acting.
 - Use \`memory_stats\` for a quick overview of store health.`;
-
-/**
- * Extract domain prefix for sibling expansion.
- * Only keys with 3+ segments expand: `user.health.diet` → `user.health`.
- * 2-segment keys like `pref.editor` or `user.fitness` are leaf-level.
- */
-function keyDomainPrefix(key: string): string | null {
-  const parts = key.split(".");
-  return parts.length >= 3 ? parts.slice(0, 2).join(".") : null;
-}
-
-/**
- * Background: compute and store embeddings for entries that are missing them.
- * Runs after a successful semantic search, populating the DB for future use.
- * Capped at 10 entries per call to avoid blocking the event loop.
- */
-async function backfillEmbeddings(
-  store: MemoryStore,
-  missing: Array<{ key: string }>,
-): Promise<void> {
-  if (missing.length === 0) return;
-  for (const { key } of missing.slice(0, 10)) {
-    const entry = store.getSemantic(key);
-    if (!entry) continue;
-    // Use the human-readable key suffix + value as embedding input
-    const displayKey = key.split(".").slice(1).join(" ");
-    const vec = await embed(`${displayKey} ${entry.value}`);
-    if (vec) store.setEmbedding(key, vec);
-  }
-}
 
 export function projectSlug(cwd: string): string {
   const parts = cwd.split("/").filter(Boolean);
