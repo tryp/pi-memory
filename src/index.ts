@@ -491,7 +491,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
-    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions.",
+    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions. Use before making assumptions about user preferences, tool choices, or project conventions. Include a limit parameter to cap results.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
@@ -515,7 +515,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_remember",
     label: "Memory Remember",
-    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys like pref.editor, project.rosie.lang, tool.sed.usage. For corrections, use type='lesson'.",
+    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys: pref.<area>.<topic>, project.<project-name>.<pattern>, tool.<name>.<usage>. For corrections, use type='lesson' with a broad category (e.g. 'testing', 'debugging', 'documentation', 'workflow'). Prefer reusing existing categories from memory_lessons over creating new ones.",
     parameters: Type.Object({
       type: Type.String({ description: "'fact' for key-value, 'lesson' for a correction" }),
       key: Type.Optional(Type.String({ description: "Dotted key for facts (e.g. pref.commit_style)" })),
@@ -567,7 +567,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_forget",
     label: "Memory Forget",
-    description: "Remove a fact or lesson from persistent memory.",
+    description: "Remove a fact or lesson from persistent memory. Use after noticing a stale, incorrect, or retracted memory. Check memory_search or memory_lessons first to find the exact key or id.",
     parameters: Type.Object({
       type: Type.String(),
       key: Type.Optional(Type.String({ description: "Key for facts" })),
@@ -604,15 +604,15 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_lessons",
     label: "Memory Lessons",
-    description: "List learned corrections and lessons from past sessions.",
+    description: "List learned corrections and lessons from past sessions. Filter by a broad category (e.g. 'testing', 'debugging') to narrow results. Use before adding a new lesson to see existing categories.",
     parameters: Type.Object({
       category: Type.Optional(Type.String({ description: "Filter by category" })),
-      limit: Type.Optional(Type.Number({ description: "Max results (default 50)" })),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 20)" })),
     }) as any,
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
 
-      const lessons = store.listLessons(params.category, params.limit ?? 50);
+      const lessons = store.listLessons(params.category, params.limit ?? 20);
       if (lessons.length === 0) {
         return ok("No lessons learned yet.");
       }
@@ -628,7 +628,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_stats",
     label: "Memory Stats",
-    description: "Show memory statistics — how many facts, lessons, and events are stored.",
+    description: "Show memory statistics — how many facts, lessons, and events are stored. Use for a quick overview of store health and size.",
     parameters: Type.Object({}) as any,
     async execute(_id, _params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");

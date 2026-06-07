@@ -491,7 +491,12 @@ function daysSince(dateStr) {
 var MEMORY_DRIFT_CAVEAT = `## Before acting on memory
 - Memory records can become stale. If a memory names a file, function, or flag \u2014 verify it still exists before recommending it. "The memory says X exists" is not the same as "X exists now."
 - If a recalled memory conflicts with what you observe in the current code or project state, trust what you observe now.
-- Memories about project state (deadlines, decisions, architecture) decay fastest \u2014 check if still relevant.`;
+- Memories about project state (deadlines, decisions, architecture) decay fastest \u2014 check if still relevant.
+
+## Searching memory proactively
+- Use \`memory_search\` to find specific facts relevant to your current task \u2014 the injected block above may be truncated or may not cover the angle you need.
+- Use \`memory_lessons\` with a category filter to review relevant learned corrections before acting.
+- Use \`memory_stats\` for a quick overview of store health.`;
 function projectSlug(cwd) {
   const parts = cwd.split("/").filter(Boolean);
   const skip = /* @__PURE__ */ new Set(["workplace", "local", "home", "src", "scratch", os.userInfo().username]);
@@ -519,7 +524,20 @@ Extract ONLY concrete, reusable facts \u2014 not summaries of what happened. Foc
    Example: { "rule": "Use sed to insert after ## Notes heading, not echo >> which appends after Tags", "category": "vault", "negative": true }
 
 5. **Validated approaches** \u2014 things the user explicitly confirmed worked well (positive signal)
-   Example: { "rule": "When deploying wiki changes, draft first and let user preview before publishing", "category": "wiki-edit", "negative": false }
+   Example: { "rule": "When deploying wiki changes, draft first and let user preview before publishing", "category": "documentation", "negative": false }
+
+## Category guidance for lessons
+
+Use broad, reusable categories \u2014 not per-file or per-session labels.
+
+**Good categories** (prefer these): testing, documentation, debugging, workflow,
+performance, security, deployment, project-structure, tooling, communication.
+
+**Avoid**: per-file slugs ("vault", "rosie-parser"), dates, session IDs,
+or topic fragments ("pentest", "blog") that won't generalize.
+
+If unsure, prefer one of the good categories above over inventing a new one.
+Merging narrow categories later is expensive; starting broad is cheap.
 
 ## What NOT to extract \u2014 these are derivable or ephemeral, and pollute memory:
 
@@ -883,8 +901,6 @@ ${text}`
     }
     if (pendingUserMessages.length >= 3) {
       try {
-        // Write consolidation data to a temp file and spawn a detached worker
-        // so the user gets their prompt back immediately.
         const data = {
           userMessages: pendingUserMessages,
           assistantMessages: pendingAssistantMessages,
@@ -893,31 +909,24 @@ ${text}`
           dbPath: resolvedDbPath,
           model: injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
           facts: store.listSemantic(void 0, 200).map((f) => ({ key: f.key, value: f.value })),
-          lessons: store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category })),
+          lessons: store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category }))
         };
         const tmpDir = mkdtempSync(join(tmpdir(), "pi-mem-bg-"));
         const dataFile = join(tmpDir, "consolidation.json");
         writeFileSync(dataFile, JSON.stringify(data));
-
-        // Resolve worker path relative to this bundle
         const workerUrl = new URL("./consolidation-worker.mjs", import.meta.url);
         const workerPath = workerUrl.pathname;
-        if (process.platform === "win32" && workerUrl.protocol === "file:") {
-          // Windows file:// path starts with / drive letter
-        }
-
         const proc = spawn(process.execPath, [workerPath, dataFile], {
           detached: true,
           stdio: ["ignore", "ignore", "pipe"],
           cwd: sessionCwd || process.cwd(),
-          env: { ...process.env },
+          env: { ...process.env }
         });
-        proc.unref(); // Allow parent to exit without waiting for child
+        proc.unref();
         proc.stderr.on("data", (d) => {
           console.error(`[pi-memory-worker] ${d.toString().trim()}`);
         });
       } catch {
-        // Best-effort — don't crash on shutdown
       }
     }
     store.close();
@@ -976,7 +985,7 @@ ${text}`
   pi.registerTool({
     name: "memory_search",
     label: "Memory Search",
-    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions.",
+    description: "Search persistent memory for facts, preferences, and project patterns the user has established across sessions. Use before making assumptions about user preferences, tool choices, or project conventions. Include a limit parameter to cap results.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
       limit: Type.Optional(Type.Number({ description: "Max results (default 10)" }))
@@ -996,7 +1005,7 @@ ${text}`
   pi.registerTool({
     name: "memory_remember",
     label: "Memory Remember",
-    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys like pref.editor, project.rosie.lang, tool.sed.usage. For corrections, use type='lesson'.",
+    description: "Store a fact, preference, or lesson in persistent memory. Use dotted keys: pref.<area>.<topic>, project.<project-name>.<pattern>, tool.<name>.<usage>. For corrections, use type='lesson' with a broad category (e.g. 'testing', 'debugging', 'documentation', 'workflow'). Prefer reusing existing categories from memory_lessons over creating new ones.",
     parameters: Type.Object({
       type: Type.String({ description: "'fact' for key-value, 'lesson' for a correction" }),
       key: Type.Optional(Type.String({ description: "Dotted key for facts (e.g. pref.commit_style)" })),
@@ -1041,7 +1050,7 @@ ${text}`
   pi.registerTool({
     name: "memory_forget",
     label: "Memory Forget",
-    description: "Remove a fact or lesson from persistent memory.",
+    description: "Remove a fact or lesson from persistent memory. Use after noticing a stale, incorrect, or retracted memory. Check memory_search or memory_lessons first to find the exact key or id.",
     parameters: Type.Object({
       type: Type.String(),
       key: Type.Optional(Type.String({ description: "Key for facts" })),
@@ -1072,14 +1081,14 @@ ${text}`
   pi.registerTool({
     name: "memory_lessons",
     label: "Memory Lessons",
-    description: "List learned corrections and lessons from past sessions.",
+    description: "List learned corrections and lessons from past sessions. Filter by a broad category (e.g. 'testing', 'debugging') to narrow results. Use before adding a new lesson to see existing categories.",
     parameters: Type.Object({
       category: Type.Optional(Type.String({ description: "Filter by category" })),
-      limit: Type.Optional(Type.Number({ description: "Max results (default 50)" }))
+      limit: Type.Optional(Type.Number({ description: "Max results (default 20)" }))
     }),
     async execute(_id, params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");
-      const lessons = store.listLessons(params.category, params.limit ?? 50);
+      const lessons = store.listLessons(params.category, params.limit ?? 20);
       if (lessons.length === 0) {
         return ok("No lessons learned yet.");
       }
@@ -1092,7 +1101,7 @@ ${text}`
   pi.registerTool({
     name: "memory_stats",
     label: "Memory Stats",
-    description: "Show memory statistics \u2014 how many facts, lessons, and events are stored.",
+    description: "Show memory statistics \u2014 how many facts, lessons, and events are stored. Use for a quick overview of store health and size.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _update, _ctx) {
       if (!store) return ok("Memory store not initialized");

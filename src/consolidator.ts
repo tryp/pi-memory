@@ -48,7 +48,20 @@ Extract ONLY concrete, reusable facts — not summaries of what happened. Focus 
    Example: { "rule": "Use sed to insert after ## Notes heading, not echo >> which appends after Tags", "category": "vault", "negative": true }
 
 5. **Validated approaches** — things the user explicitly confirmed worked well (positive signal)
-   Example: { "rule": "When deploying wiki changes, draft first and let user preview before publishing", "category": "wiki-edit", "negative": false }
+   Example: { "rule": "When deploying wiki changes, draft first and let user preview before publishing", "category": "documentation", "negative": false }
+
+## Category guidance for lessons
+
+Use broad, reusable categories — not per-file or per-session labels.
+
+**Good categories** (prefer these): testing, documentation, debugging, workflow,
+performance, security, deployment, project-structure, tooling, communication.
+
+**Avoid**: per-file slugs ("vault", "rosie-parser"), dates, session IDs,
+or topic fragments ("pentest", "blog") that won't generalize.
+
+If unsure, prefer one of the good categories above over inventing a new one.
+Merging narrow categories later is expensive; starting broad is cheap.
 
 ## What NOT to extract — these are derivable or ephemeral, and pollute memory:
 
