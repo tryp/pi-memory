@@ -19,6 +19,25 @@ export interface ContextBlock {
 }
 
 /**
+ * Context about recent agent tool activity, collected between turns.
+ * Used to enrich memory search queries beyond the user's prompt alone.
+ */
+export interface ToolTurnContext {
+  /** Names of tools called since the last agent turn */
+  toolNames: string[];
+  /** The most recently called tool */
+  lastTool?: string;
+  /** Whether any tool call produced an error */
+  hasErrors: boolean;
+  /** Error-related terms extracted from failed tool calls */
+  errorTerms: string[];
+  /** Whether edit/write tools were called (triggers tool.* prefix search) */
+  editActivity: boolean;
+  /** Whether test-related commands were run (triggers debugging/testing lesson search) */
+  testActivity: boolean;
+}
+
+/**
  * Configuration for lesson injection behavior.
  * - "all": inject all lessons (original behavior, default)
  * - "selective": use semantic search to pick relevant lessons + category filtering
@@ -67,23 +86,31 @@ export interface InjectorConfig {
  * Build context block. When `prompt` is provided, uses selective injection
  * (search-based). Otherwise falls back to prefix-based dump.
  */
-export function buildContextBlock(store: MemoryStore, cwd?: string, prompt?: string, config?: InjectorConfig): ContextBlock {
+export function buildContextBlock(store: MemoryStore, cwd?: string, prompt?: string, config?: InjectorConfig, toolContext?: ToolTurnContext): ContextBlock {
   if (prompt?.trim()) {
-    return buildSelectiveBlock(store, prompt, cwd, config);
+    return buildSelectiveBlock(store, prompt, cwd, config, toolContext);
   }
   return buildFallbackBlock(store, cwd);
 }
 
 // ─── Selective injection ─────────────────────────────────────────────
 
-function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, config?: InjectorConfig): ContextBlock {
+function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, config?: InjectorConfig, toolContext?: ToolTurnContext): ContextBlock {
   const sections: string[] = [];
   let semanticCount = 0;
   let lessonCount = 0;
   const mode = config?.lessonInjection ?? "all";
 
-  // Search semantic memory using the user's prompt
-  const results = store.searchSemantic(prompt, SEARCH_LIMIT);
+  // Enrich search query with recent tool activity context
+  const queryParts = [prompt];
+  if (toolContext) {
+    if (toolContext.toolNames.length > 0) queryParts.push(...toolContext.toolNames);
+    if (toolContext.errorTerms.length > 0) queryParts.push(...toolContext.errorTerms);
+    if (toolContext.lastTool) queryParts.push(toolContext.lastTool);
+  }
+  const enrichedQuery = queryParts.join(" ");
+
+  const results = store.searchSemantic(enrichedQuery, SEARCH_LIMIT);
 
   // Also search with project slug if we have a cwd, to pull in project context
   const slug = cwd ? projectSlug(cwd) : "";
@@ -121,14 +148,50 @@ function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, c
     store.touchAccessed(filteredResults.map(r => r.key));
   }
 
-  // Inject lessons — either all or filtered by relevance + project scope
+  // ── Activity-triggered bonus searches ──
+  // If the agent was editing files, pull in tool.* preferences
+  if (toolContext?.editActivity) {
+    const toolPrefs = store.listSemantic("tool.", 5);
+    for (const tp of toolPrefs) {
+      if (!results.some(r => r.key === tp.key)) {
+        results.push(tp);
+      }
+    }
+  }
+
+  // If tools errored or tests ran, pull in debugging/testing lessons
+  let bonusLessons: LessonEntry[] = [];
+  if (toolContext?.hasErrors || toolContext?.testActivity) {
+    const searchTerms: string[] = [];
+    if (toolContext.hasErrors) {
+      searchTerms.push("error", "fail", "debug");
+      if (toolContext.lastTool) searchTerms.push(toolContext.lastTool);
+      if (toolContext.errorTerms.length > 0) searchTerms.push(...toolContext.errorTerms);
+    }
+    if (toolContext.testActivity) {
+      searchTerms.push("test", "testing");
+    }
+    if (searchTerms.length > 0) {
+      bonusLessons = store.searchLessons(searchTerms.join(" "), 5);
+    }
+  }
+
+  // ── Lesson injection ──
   const lessons = mode === "selective"
     ? getRelevantLessons(store, prompt, cwd)
     : store.listLessons(undefined, 50, slug || undefined);
 
-  if (lessons.length > 0) {
-    const corrections = lessons.filter(l => l.negative);
-    const positives = lessons.filter(l => !l.negative);
+  // Merge bonus lessons into the main lesson set (dedup by id)
+  const allLessons = [...lessons];
+  for (const bl of bonusLessons) {
+    if (!allLessons.some(l => l.id === bl.id)) {
+      allLessons.push(bl);
+    }
+  }
+
+  if (allLessons.length > 0) {
+    const corrections = allLessons.filter(l => l.negative);
+    const positives = allLessons.filter(l => !l.negative);
 
     if (corrections.length > 0) {
       const formatted = corrections.map(l =>
@@ -142,7 +205,7 @@ function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, c
       );
       sections.push(formatSection("Validated Approaches", formatted));
     }
-    lessonCount = lessons.length;
+    lessonCount = allLessons.length;
   }
 
   if (sections.length === 0) {

@@ -324,18 +324,25 @@ import os from "node:os";
 var MAX_CONTEXT_CHARS = 8e3;
 var SEARCH_LIMIT = 15;
 var LESSON_SEARCH_LIMIT = 15;
-function buildContextBlock(store, cwd, prompt, config) {
+function buildContextBlock(store, cwd, prompt, config, toolContext) {
   if (prompt?.trim()) {
-    return buildSelectiveBlock(store, prompt, cwd, config);
+    return buildSelectiveBlock(store, prompt, cwd, config, toolContext);
   }
   return buildFallbackBlock(store, cwd);
 }
-function buildSelectiveBlock(store, prompt, cwd, config) {
+function buildSelectiveBlock(store, prompt, cwd, config, toolContext) {
   const sections = [];
   let semanticCount = 0;
   let lessonCount = 0;
   const mode = config?.lessonInjection ?? "all";
-  const results = store.searchSemantic(prompt, SEARCH_LIMIT);
+  const queryParts = [prompt];
+  if (toolContext) {
+    if (toolContext.toolNames.length > 0) queryParts.push(...toolContext.toolNames);
+    if (toolContext.errorTerms.length > 0) queryParts.push(...toolContext.errorTerms);
+    if (toolContext.lastTool) queryParts.push(toolContext.lastTool);
+  }
+  const enrichedQuery = queryParts.join(" ");
+  const results = store.searchSemantic(enrichedQuery, SEARCH_LIMIT);
   const slug = cwd ? projectSlug(cwd) : "";
   if (slug) {
     const projectResults = store.searchSemantic(slug, 5);
@@ -357,10 +364,39 @@ function buildSelectiveBlock(store, prompt, cwd, config) {
     semanticCount = filteredResults.length;
     store.touchAccessed(filteredResults.map((r) => r.key));
   }
+  if (toolContext?.editActivity) {
+    const toolPrefs = store.listSemantic("tool.", 5);
+    for (const tp of toolPrefs) {
+      if (!results.some((r) => r.key === tp.key)) {
+        results.push(tp);
+      }
+    }
+  }
+  let bonusLessons = [];
+  if (toolContext?.hasErrors || toolContext?.testActivity) {
+    const searchTerms = [];
+    if (toolContext.hasErrors) {
+      searchTerms.push("error", "fail", "debug");
+      if (toolContext.lastTool) searchTerms.push(toolContext.lastTool);
+      if (toolContext.errorTerms.length > 0) searchTerms.push(...toolContext.errorTerms);
+    }
+    if (toolContext.testActivity) {
+      searchTerms.push("test", "testing");
+    }
+    if (searchTerms.length > 0) {
+      bonusLessons = store.searchLessons(searchTerms.join(" "), 5);
+    }
+  }
   const lessons = mode === "selective" ? getRelevantLessons(store, prompt, cwd) : store.listLessons(void 0, 50, slug || void 0);
-  if (lessons.length > 0) {
-    const corrections = lessons.filter((l) => l.negative);
-    const positives = lessons.filter((l) => !l.negative);
+  const allLessons = [...lessons];
+  for (const bl of bonusLessons) {
+    if (!allLessons.some((l) => l.id === bl.id)) {
+      allLessons.push(bl);
+    }
+  }
+  if (allLessons.length > 0) {
+    const corrections = allLessons.filter((l) => l.negative);
+    const positives = allLessons.filter((l) => !l.negative);
     if (corrections.length > 0) {
       const formatted = corrections.map(
         (l) => `DON'T: ${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
@@ -373,7 +409,7 @@ function buildSelectiveBlock(store, prompt, cwd, config) {
       );
       sections.push(formatSection("Validated Approaches", formatted));
     }
-    lessonCount = lessons.length;
+    lessonCount = allLessons.length;
   }
   if (sections.length === 0) {
     return { text: "", stats: { semantic: 0, lessons: 0 } };
@@ -784,6 +820,36 @@ function index_default(pi) {
   let cachedCtx = null;
   let resolvedDbPath = DEFAULT_DB_PATH;
   let injectorConfig = readSettingsConfig();
+  const MAX_TOOL_ACTIVITY = 10;
+  const recentToolActivity = [];
+  function buildToolContext() {
+    return {
+      toolNames: [...new Set(recentToolActivity.map((a) => a.toolName))],
+      lastTool: recentToolActivity.length > 0 ? recentToolActivity[recentToolActivity.length - 1].toolName : void 0,
+      hasErrors: recentToolActivity.some((a) => a.isError),
+      errorTerms: recentToolActivity.filter((a) => a.isError && a.errorSnippet).map((a) => a.errorSnippet).slice(0, 3),
+      editActivity: recentToolActivity.some(
+        (a) => a.toolName === "edit" || a.toolName === "write"
+      ),
+      testActivity: recentToolActivity.some(
+        (a) => a.toolName === "bash" && typeof a.args?.command === "string" && /\\b(test|spec|jest|mocha|pytest|vitest|check|lint)\\b/i.test(a.args.command)
+      )
+    };
+  }
+  function extractErrorSnippet(result) {
+    if (!result) return void 0;
+    if (typeof result === "string") {
+      const lines = result.split("\\n").filter((l) => /(error|fail|exit code|not found|enoent)/i.test(l));
+      return lines.slice(0, 2).join(" ").slice(0, 120) || void 0;
+    }
+    if (typeof result.content === "string") {
+      return extractErrorSnippet(result.content);
+    }
+    if (Array.isArray(result.content)) {
+      return extractErrorSnippet(result.content.map((c) => c.text || "").join("\\n"));
+    }
+    return void 0;
+  }
   pi.on("session_start", async (_event, ctx) => {
     try {
       sessionCwd = ctx.cwd;
@@ -849,10 +915,27 @@ function index_default(pi) {
       ctx.ui.notify(`pi-memory: failed to open store: ${err.message}`, "warning");
     }
   });
+  pi.on("tool_execution_end", (event, _ctx) => {
+    if (!store) return;
+    if (!injectorConfig.perTurnInjection) return;
+    const activity = {
+      toolName: event.toolName,
+      isError: event.isError,
+      errorSnippet: event.isError ? extractErrorSnippet(event.result) : void 0,
+      args: event.args,
+      timestamp: Date.now()
+    };
+    recentToolActivity.push(activity);
+    if (recentToolActivity.length > MAX_TOOL_ACTIVITY) {
+      recentToolActivity.shift();
+    }
+  });
   pi.on("before_agent_start", async (event, ctx) => {
     if (!store) return;
     if (!injectorConfig.perTurnInjection) return;
-    const { text } = buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    const toolCtx = recentToolActivity.length > 0 ? buildToolContext() : void 0;
+    recentToolActivity.length = 0;
+    const { text } = buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig, toolCtx);
     if (!text) return;
     return {
       systemPrompt: `${event.systemPrompt}
